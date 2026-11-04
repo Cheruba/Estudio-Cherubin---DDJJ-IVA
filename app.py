@@ -9,33 +9,25 @@ st.caption("Procesamiento automático según esquema de Ventas, Compras y Determ
 
 # --- FUNCIÓN ROBUSTA PARA LEER EXCEL EN MEMORIA ---
 def cargar_excel_seguro(uploaded_file, header=1):
-    """
-    Intenta leer el archivo Excel probando engines alternativos (openpyxl y xlrd)
-    para evitar el error 'Excel file format cannot be determined'.
-    """
     contenido = uploaded_file.read()
     filename = uploaded_file.name.lower()
     
-    # 1. Si es .xlsx o termina en xlsx
     if filename.endswith('.xlsx'):
         try:
             return pd.read_excel(io.BytesIO(contenido), engine='openpyxl', header=header)
         except Exception:
             pass
             
-    # 2. Si es .xls tradicional
     try:
         return pd.read_excel(io.BytesIO(contenido), engine='xlrd', header=header)
     except Exception:
         pass
 
-    # 3. Reintento con openpyxl sin importar la extensión
     try:
         return pd.read_excel(io.BytesIO(contenido), engine='openpyxl', header=header)
     except Exception:
         pass
 
-    # 4. Reintento leyendo como HTML (sistemas antiguos que exportan HTML con extensión .xls)
     try:
         dfs = pd.read_html(io.BytesIO(contenido), header=header)
         if dfs:
@@ -43,7 +35,18 @@ def cargar_excel_seguro(uploaded_file, header=1):
     except Exception:
         pass
 
-    raise ValueError(f"No se pudo determinar el formato del archivo '{uploaded_file.name}'. Verificá que no esté dañado.")
+    raise ValueError(f"No se pudo determinar el formato del archivo '{uploaded_file.name}'.")
+
+def clean_num(val):
+    if pd.isna(val): 
+        return 0.0
+    if isinstance(val, (int, float)): 
+        return float(val)
+    s = str(val).strip().replace('.', '').replace(',', '.')
+    try:
+        return float(s)
+    except Exception:
+        return 0.0
 
 # --- ARCHIVOS SIDEBAR ---
 st.sidebar.header("📁 Cargar Archivos del Período")
@@ -60,13 +63,10 @@ btn_procesar = st.sidebar.button("🚀 LIQUIDAR IVA (F.2002)", use_container_wid
 if btn_procesar and file_ventas and file_compras:
     with st.spinner("Procesando planillas y agrupando según esquema DDJJ..."):
         try:
-            # 1. CARGA Y LIMPIEZA DE VENTAS
+            # 1. VENTAS
             df_v_raw = cargar_excel_seguro(file_ventas, header=1)
-            
-            # Limpiar nombres de columnas
             df_v_raw.columns = [str(c).strip() for c in df_v_raw.columns]
             
-            # Filtrar filas válidas de comprobantes
             col_cbte_v = [c for c in df_v_raw.columns if 'comprobante' in c.lower()]
             col_fecha_v = [c for c in df_v_raw.columns if 'fecha' in c.lower()]
             
@@ -75,20 +75,11 @@ if btn_procesar and file_ventas and file_compras:
             else:
                 df_v = df_v_raw.copy()
 
-            def clean_num(val):
-                if pd.isna(val): return 0.0
-                if isinstance(val, (int, float)): return float(val)
-                s = str(val).strip().replace('.', '').replace(',', '.')
-                try:
-                    return float(s)
-                except:
-                    return 0.0
-
             for c in ['Neto Gravado', 'Exento', 'No Gravado', 'IVA', 'Total del Comprobante', 'Total del concepto']:
                 if c in df_v.columns:
                     df_v[c] = df_v[c].apply(clean_num)
 
-            # 2. CARGA Y LIMPIEZA DE COMPRAS
+            # 2. COMPRAS
             df_c_raw = cargar_excel_seguro(file_compras, header=1)
             df_c_raw.columns = [str(c).strip() for c in df_c_raw.columns]
 
@@ -104,7 +95,7 @@ if btn_procesar and file_ventas and file_compras:
                 if c in df_c.columns:
                     df_c[c] = df_c[c].apply(clean_num)
 
-            # 3. CÁLCULO DE DÉBITO Y CRÉDITO FISCAL SEGÚN FÓRMULAS F.2002
+            # 3. CÁLCULOS DDJJ F.2002
             col_tipo_v = col_cbte_v[0] if col_cbte_v else 'Comprobante'
             col_tipo_c = col_cbte_c[0] if col_cbte_c else 'Comprobante'
 
@@ -114,17 +105,24 @@ if btn_procesar and file_ventas and file_compras:
             c_facturas = df_c[~df_c[col_tipo_c].astype(str).str.contains('Nota de Crédito', case=False)]
             c_nc = df_c[df_c[col_tipo_c].astype(str).str.contains('Nota de Crédito', case=False)]
 
-            # F.2002: Débito = IVA Ventas Facturas - IVA NC Compras
-            debito_fiscal = v_facturas['IVA'].sum() - abs(c_nc['IVA'].sum()) if 'IVA' in df_v.columns else 0.0
+            # Asegurar conversión a float explícita para evitar tipos 'str' en sum()
+            iva_v_facturas = float(pd.to_numeric(v_facturas['IVA'], errors='coerce').sum()) if 'IVA' in v_facturas.columns else 0.0
+            iva_v_nc = float(pd.to_numeric(v_nc['IVA'], errors='coerce').sum()) if 'IVA' in v_nc.columns else 0.0
+
+            iva_c_facturas = float(pd.to_numeric(c_facturas['IVA'], errors='coerce').sum()) if 'IVA' in c_facturas.columns else 0.0
+            iva_c_nc = float(pd.to_numeric(c_nc['IVA'], errors='coerce').sum()) if 'IVA' in c_nc.columns else 0.0
+
+            # Débito = IVA Ventas Facturas - IVA NC Compras
+            debito_fiscal = iva_v_facturas - abs(iva_c_nc)
             
-            # F.2002: Crédito = IVA Compras Facturas - IVA NC Ventas
-            credito_fiscal = c_facturas['IVA'].sum() - abs(v_nc['IVA'].sum()) if 'IVA' in df_c.columns else 0.0
+            # Crédito = IVA Compras Facturas - IVA NC Ventas
+            credito_fiscal = iva_c_facturas - abs(iva_v_nc)
 
             saldo_tecnico = debito_fiscal - credito_fiscal
             total_pagos_cuenta = percepciones_input + retenciones_input + anticipos_input
             saldo_afip = saldo_tecnico - total_pagos_cuenta
 
-            # --- MOSTRAR RESULTADOS EN PANTALLA ---
+            # --- VISTA EN PANTALLA ---
             st.header("📋 Borrador Liquidación IVA (F.2002)")
             col1, col2, col3 = st.columns(3)
 
@@ -152,7 +150,7 @@ if btn_procesar and file_ventas and file_compras:
 
             st.table(res_df)
 
-            # --- BOTÓN PARA DESCARGAR EXCEL COMPLETO ---
+            # --- BOTÓN DESCARGA EXCEL ---
             output = io.BytesIO()
             with pd.ExcelWriter(output, engine='openpyxl') as writer:
                 df_v.to_excel(writer, sheet_name='Ventas', index=False)
