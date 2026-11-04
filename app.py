@@ -7,6 +7,44 @@ st.set_page_config(page_title="Estudio Cherubin - Liquidación DDJJ IVA F.2002",
 st.title("📊 Estudio Cherubin - Liquidación de IVA (F.2002)")
 st.caption("Procesamiento automático según esquema de Ventas, Compras y Determinación F.2002")
 
+# --- FUNCIÓN ROBUSTA PARA LEER EXCEL EN MEMORIA ---
+def cargar_excel_seguro(uploaded_file, header=1):
+    """
+    Intenta leer el archivo Excel probando engines alternativos (openpyxl y xlrd)
+    para evitar el error 'Excel file format cannot be determined'.
+    """
+    contenido = uploaded_file.read()
+    filename = uploaded_file.name.lower()
+    
+    # 1. Si es .xlsx o termina en xlsx
+    if filename.endswith('.xlsx'):
+        try:
+            return pd.read_excel(io.BytesIO(contenido), engine='openpyxl', header=header)
+        except Exception:
+            pass
+            
+    # 2. Si es .xls tradicional
+    try:
+        return pd.read_excel(io.BytesIO(contenido), engine='xlrd', header=header)
+    except Exception:
+        pass
+
+    # 3. Reintento con openpyxl sin importar la extensión
+    try:
+        return pd.read_excel(io.BytesIO(contenido), engine='openpyxl', header=header)
+    except Exception:
+        pass
+
+    # 4. Reintento leyendo como HTML (sistemas antiguos que exportan HTML con extensión .xls)
+    try:
+        dfs = pd.read_html(io.BytesIO(contenido), header=header)
+        if dfs:
+            return dfs[0]
+    except Exception:
+        pass
+
+    raise ValueError(f"No se pudo determinar el formato del archivo '{uploaded_file.name}'. Verificá que no esté dañado.")
+
 # --- ARCHIVOS SIDEBAR ---
 st.sidebar.header("📁 Cargar Archivos del Período")
 file_ventas = st.sidebar.file_uploader("1. Listado de VENTAS (.xls / .xlsx)", type=["xls", "xlsx"])
@@ -21,94 +59,114 @@ btn_procesar = st.sidebar.button("🚀 LIQUIDAR IVA (F.2002)", use_container_wid
 
 if btn_procesar and file_ventas and file_compras:
     with st.spinner("Procesando planillas y agrupando según esquema DDJJ..."):
-        # 1. CARGA Y LIMPIEZA DE VENTAS
-        df_v_raw = pd.read_excel(file_ventas, engine='xlrd' if file_ventas.name.endswith('.xls') else None, header=1)
-        df_v = df_v_raw[df_v_raw['Fecha Contable'].notnull() & df_v_raw['Comprobante'].astype(str).str.contains('Factura|Nota de Crédito', case=False, na=False)].copy()
+        try:
+            # 1. CARGA Y LIMPIEZA DE VENTAS
+            df_v_raw = cargar_excel_seguro(file_ventas, header=1)
+            
+            # Limpiar nombres de columnas
+            df_v_raw.columns = [str(c).strip() for c in df_v_raw.columns]
+            
+            # Filtrar filas válidas de comprobantes
+            col_cbte_v = [c for c in df_v_raw.columns if 'comprobante' in c.lower()]
+            col_fecha_v = [c for c in df_v_raw.columns if 'fecha' in c.lower()]
+            
+            if col_cbte_v and col_fecha_v:
+                df_v = df_v_raw[df_v_raw[col_fecha_v[0]].notnull() & df_v_raw[col_cbte_v[0]].astype(str).str.contains('Factura|Nota de Crédito', case=False, na=False)].copy()
+            else:
+                df_v = df_v_raw.copy()
 
-        def clean_num(val):
-            if pd.isna(val): return 0.0
-            if isinstance(val, (int, float)): return float(val)
-            return float(str(val).strip().replace('.', '').replace(',', '.'))
+            def clean_num(val):
+                if pd.isna(val): return 0.0
+                if isinstance(val, (int, float)): return float(val)
+                s = str(val).strip().replace('.', '').replace(',', '.')
+                try:
+                    return float(s)
+                except:
+                    return 0.0
 
-        for c in ['Neto Gravado', 'Exento', 'No Gravado', 'IVA', 'Total del Comprobante']:
-            if c in df_v.columns:
-                df_v[c] = df_v[c].apply(clean_num)
+            for c in ['Neto Gravado', 'Exento', 'No Gravado', 'IVA', 'Total del Comprobante', 'Total del concepto']:
+                if c in df_v.columns:
+                    df_v[c] = df_v[c].apply(clean_num)
 
-        # Crear Claves Auxiliares de Ventas (Cond, Actividad, Tipo, F, Detalle)
-        df_v['Cond'] = df_v['Situación IVA'].apply(lambda x: 1 if 'Responsable Inscripto' in str(x) else 2)
-        df_v['Actividad'] = df_v['Cond'].apply(lambda x: 101012 if x == 1 else 472130)
-        df_v['Tipo'] = df_v['Cond'].apply(lambda x: 'RI' if x == 1 else 'CF')
-        df_v['F'] = df_v['Letra'].astype(str) + df_v['%Alícuota'].astype(str).str.replace('.0', '', regex=False).str.replace('.', ',', regex=False)
-        df_v['Detalle'] = df_v['Actividad'].astype(str) + df_v['F'] + df_v['Tipo'] + df_v['Comprobante'].astype(str).str.strip()
+            # 2. CARGA Y LIMPIEZA DE COMPRAS
+            df_c_raw = cargar_excel_seguro(file_compras, header=1)
+            df_c_raw.columns = [str(c).strip() for c in df_c_raw.columns]
 
-        # 2. CARGA Y LIMPIEZA DE COMPRAS
-        df_c_raw = pd.read_excel(file_compras, engine='xlrd' if file_compras.name.endswith('.xls') else None, header=1)
-        df_c = df_c_raw[df_c_raw['Fecha Contable'].notnull() & df_c_raw['Comprobante'].astype(str).str.contains('Factura|Nota de Crédito|Liq Compra Directa', case=False, na=False)].copy()
+            col_cbte_c = [c for c in df_c_raw.columns if 'comprobante' in c.lower()]
+            col_fecha_c = [c for c in df_c_raw.columns if 'fecha' in c.lower()]
 
-        for c in ['Neto Gravado', 'Subtotal Exento', 'No Gravado', 'IVA', 'Subtotal de Percepciones', 'Total del Comprobante']:
-            if c in df_c.columns:
-                df_c[c] = df_c[c].apply(clean_num)
+            if col_cbte_c and col_fecha_c:
+                df_c = df_c_raw[df_c_raw[col_fecha_c[0]].notnull() & df_c_raw[col_cbte_c[0]].astype(str).str.contains('Factura|Nota de Crédito|Liq Compra Directa', case=False, na=False)].copy()
+            else:
+                df_c = df_c_raw.copy()
 
-        df_c['Clave_Compra'] = df_c['Comprobante'].astype(str).str.strip() + df_c['Letra'].astype(str).str.strip() + df_c['%Alícuota'].astype(str).str.replace('.0', '', regex=False).str.replace('.', ',', regex=False)
+            for c in ['Neto Gravado', 'Subtotal Exento', 'No Gravado', 'IVA', 'Subtotal de Percepciones', 'Total del Comprobante']:
+                if c in df_c.columns:
+                    df_c[c] = df_c[c].apply(clean_num)
 
-        # 3. CÁLCULO DE DÉBITO Y CRÉDITO FISCAL SEGÚN FÓRMULAS F.2002
-        v_facturas = df_v[~df_v['Comprobante'].astype(str).str.contains('Nota de Crédito', case=False)]
-        v_nc = df_v[df_v['Comprobante'].astype(str).str.contains('Nota de Crédito', case=False)]
+            # 3. CÁLCULO DE DÉBITO Y CRÉDITO FISCAL SEGÚN FÓRMULAS F.2002
+            col_tipo_v = col_cbte_v[0] if col_cbte_v else 'Comprobante'
+            col_tipo_c = col_cbte_c[0] if col_cbte_c else 'Comprobante'
 
-        c_facturas = df_c[~df_c['Comprobante'].astype(str).str.contains('Nota de Crédito', case=False)]
-        c_nc = df_c[df_c['Comprobante'].astype(str).str.contains('Nota de Crédito', case=False)]
+            v_facturas = df_v[~df_v[col_tipo_v].astype(str).str.contains('Nota de Crédito', case=False)]
+            v_nc = df_v[df_v[col_tipo_v].astype(str).str.contains('Nota de Crédito', case=False)]
 
-        # F.2002: Débito = IVA Ventas Facturas - IVA NC Compras
-        debito_fiscal = v_facturas['IVA'].sum() - abs(c_nc['IVA'].sum())
-        
-        # F.2002: Crédito = IVA Compras Facturas - IVA NC Ventas
-        credito_fiscal = c_facturas['IVA'].sum() - abs(v_nc['IVA'].sum())
+            c_facturas = df_c[~df_c[col_tipo_c].astype(str).str.contains('Nota de Crédito', case=False)]
+            c_nc = df_c[df_c[col_tipo_c].astype(str).str.contains('Nota de Crédito', case=False)]
 
-        saldo_tecnico = debito_fiscal - credito_fiscal
-        total_pagos_cuenta = percepciones_input + retenciones_input + anticipos_input
-        saldo_afip = saldo_tecnico - total_pagos_cuenta
+            # F.2002: Débito = IVA Ventas Facturas - IVA NC Compras
+            debito_fiscal = v_facturas['IVA'].sum() - abs(c_nc['IVA'].sum()) if 'IVA' in df_v.columns else 0.0
+            
+            # F.2002: Crédito = IVA Compras Facturas - IVA NC Ventas
+            credito_fiscal = c_facturas['IVA'].sum() - abs(v_nc['IVA'].sum()) if 'IVA' in df_c.columns else 0.0
 
-        # --- MOSTRAR RESULTADOS EN PANTALLA ---
-        st.header("📋 Borrador Liquidación IVA (F.2002)")
-        col1, col2, col3 = st.columns(3)
+            saldo_tecnico = debito_fiscal - credito_fiscal
+            total_pagos_cuenta = percepciones_input + retenciones_input + anticipos_input
+            saldo_afip = saldo_tecnico - total_pagos_cuenta
 
-        col1.metric("Débito Fiscal Total", f"${debito_fiscal:,.2f}")
-        col2.metric("Crédito Fiscal Total", f"${credito_fiscal:,.2f}")
-        col3.metric(
-            "Saldo Técnico", 
-            f"${abs(saldo_tecnico):,.2f}", 
-            delta="A Favor AFIP" if saldo_tecnico > 0 else "A Favor Contribuyente",
-            delta_color="inverse" if saldo_tecnico > 0 else "normal"
-        )
+            # --- MOSTRAR RESULTADOS EN PANTALLA ---
+            st.header("📋 Borrador Liquidación IVA (F.2002)")
+            col1, col2, col3 = st.columns(3)
 
-        st.markdown("---")
-        st.subheader("💵 Determinación Final del Impuesto")
+            col1.metric("Débito Fiscal Total", f"${debito_fiscal:,.2f}")
+            col2.metric("Crédito Fiscal Total", f"${credito_fiscal:,.2f}")
+            col3.metric(
+                "Saldo Técnico", 
+                f"${abs(saldo_tecnico):,.2f}", 
+                delta="A Favor AFIP" if saldo_tecnico > 0 else "A Favor Contribuyente",
+                delta_color="inverse" if saldo_tecnico > 0 else "normal"
+            )
 
-        res_df = pd.DataFrame([
-            {"Concepto": "Total Débito Fiscal", "Monto": f"${debito_fiscal:,.2f}"},
-            {"Concepto": "Total Crédito Fiscal", "Monto": f"${credito_fiscal:,.2f}"},
-            {"Concepto": "Saldo Técnico a Favor de AFIP", "Monto": f"${max(0.0, saldo_tecnico):,.2f}"},
-            {"Concepto": "Percepciones del Período", "Monto": f"${percepciones_input:,.2f}"},
-            {"Concepto": "Retenciones del Período", "Monto": f"${retenciones_input:,.2f}"},
-            {"Concepto": "Anticipos Pagados", "Monto": f"${anticipos_input:,.2f}"},
-            {"Concepto": "SALDO A PAGAR A AFIP", "Monto": f"${max(0.0, saldo_afip):,.2f}"}
-        ])
+            st.markdown("---")
+            st.subheader("💵 Determinación Final del Impuesto")
 
-        st.table(res_df)
+            res_df = pd.DataFrame([
+                {"Concepto": "Total Débito Fiscal", "Monto": f"${debito_fiscal:,.2f}"},
+                {"Concepto": "Total Crédito Fiscal", "Monto": f"${credito_fiscal:,.2f}"},
+                {"Concepto": "Saldo Técnico a Favor de AFIP", "Monto": f"${max(0.0, saldo_tecnico):,.2f}"},
+                {"Concepto": "Percepciones del Período", "Monto": f"${percepciones_input:,.2f}"},
+                {"Concepto": "Retenciones del Período", "Monto": f"${retenciones_input:,.2f}"},
+                {"Concepto": "Anticipos Pagados", "Monto": f"${anticipos_input:,.2f}"},
+                {"Concepto": "SALDO A PAGAR A AFIP", "Monto": f"${max(0.0, saldo_afip):,.2f}"}
+            ])
 
-        # --- BOTÓN PARA DESCARGAR EXCEL COMPLETO ---
-        output = io.BytesIO()
-        with pd.ExcelWriter(output, engine='openpyxl') as writer:
-            df_v.to_excel(writer, sheet_name='Ventas', index=False)
-            df_c.to_excel(writer, sheet_name='Compras', index=False)
-            res_df.to_excel(writer, sheet_name='DDJJ_IVA', index=False)
+            st.table(res_df)
 
-        st.download_button(
-            label="📥 Descargar Liquidación Consolidada en Excel",
-            data=output.getvalue(),
-            file_name="liquidacion_ddjj_iva_f2002.xlsx",
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            use_container_width=True
-        )
+            # --- BOTÓN PARA DESCARGAR EXCEL COMPLETO ---
+            output = io.BytesIO()
+            with pd.ExcelWriter(output, engine='openpyxl') as writer:
+                df_v.to_excel(writer, sheet_name='Ventas', index=False)
+                df_c.to_excel(writer, sheet_name='Compras', index=False)
+                res_df.to_excel(writer, sheet_name='DDJJ_IVA', index=False)
+
+            st.download_button(
+                label="📥 Descargar Liquidación Consolidada en Excel",
+                data=output.getvalue(),
+                file_name="liquidacion_ddjj_iva_f2002.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                use_container_width=True
+            )
+        except Exception as e:
+            st.error(f"Error al procesar los archivos: {e}")
 else:
     st.info("👈 Cargá en la barra lateral tus archivos de Ventas y Compras para generar la liquidación F.2002.")
