@@ -8,34 +8,51 @@ st.title("📊 Estudio Cherubin - Liquidación de IVA (F.2002)")
 st.caption("Procesamiento automático según esquema de Ventas, Compras y Determinación F.2002")
 
 # --- FUNCIÓN ROBUSTA PARA LEER EXCEL EN MEMORIA ---
-def cargar_excel_seguro(uploaded_file, header=1):
+def cargar_excel_seguro(uploaded_file):
     contenido = uploaded_file.read()
     filename = uploaded_file.name.lower()
     
+    df = None
     if filename.endswith('.xlsx'):
         try:
-            return pd.read_excel(io.BytesIO(contenido), engine='openpyxl', header=header)
+            df = pd.read_excel(io.BytesIO(contenido), engine='openpyxl', header=None)
         except Exception:
             pass
-            
-    try:
-        return pd.read_excel(io.BytesIO(contenido), engine='xlrd', header=header)
-    except Exception:
-        pass
 
-    try:
-        return pd.read_excel(io.BytesIO(contenido), engine='openpyxl', header=header)
-    except Exception:
-        pass
+    if df is None:
+        try:
+            df = pd.read_excel(io.BytesIO(contenido), engine='xlrd', header=None)
+        except Exception:
+            pass
 
-    try:
-        dfs = pd.read_html(io.BytesIO(contenido), header=header)
-        if dfs:
-            return dfs[0]
-    except Exception:
-        pass
+    if df is None:
+        try:
+            df = pd.read_excel(io.BytesIO(contenido), engine='openpyxl', header=None)
+        except Exception:
+            pass
 
-    raise ValueError(f"No se pudo determinar el formato del archivo '{uploaded_file.name}'.")
+    if df is None:
+        try:
+            dfs = pd.read_html(io.BytesIO(contenido), header=None)
+            if dfs:
+                df = dfs[0]
+        except Exception:
+            pass
+
+    if df is None:
+        raise ValueError(f"No se pudo leer el archivo '{uploaded_file.name}'.")
+
+    # Buscar automáticamente en qué fila están los encabezados reales (donde esté 'IVA' o 'Comprobante' o 'Neto')
+    header_row = 0
+    for idx, row in df.iterrows():
+        row_str = " ".join([str(val) for val in row.values if pd.notna(val)]).lower()
+        if 'neto' in row_str or 'alícuota' in row_str or 'comprobante' in row_str or 'iva' in row_str:
+            header_row = idx
+            break
+
+    df.columns = [str(c).strip() for c in df.iloc[header_row].values]
+    df = df.iloc[header_row + 1:].reset_index(drop=True)
+    return df
 
 def clean_num(val):
     if pd.isna(val): 
@@ -64,53 +81,53 @@ if btn_procesar and file_ventas and file_compras:
     with st.spinner("Procesando planillas y agrupando según esquema DDJJ..."):
         try:
             # 1. VENTAS
-            df_v_raw = cargar_excel_seguro(file_ventas, header=1)
-            df_v_raw.columns = [str(c).strip() for c in df_v_raw.columns]
+            df_v = cargar_excel_seguro(file_ventas)
             
-            col_cbte_v = [c for c in df_v_raw.columns if 'comprobante' in c.lower()]
-            col_fecha_v = [c for c in df_v_raw.columns if 'fecha' in c.lower()]
+            # Buscar columnas dinámicamente
+            col_iva_v = [c for c in df_v.columns if c.lower() == 'iva']
+            col_cbte_v = [c for c in df_v.columns if 'comprobante' in c.lower()]
             
-            if col_cbte_v and col_fecha_v:
-                df_v = df_v_raw[df_v_raw[col_fecha_v[0]].notnull() & df_v_raw[col_cbte_v[0]].astype(str).str.contains('Factura|Nota de Crédito', case=False, na=False)].copy()
-            else:
-                df_v = df_v_raw.copy()
+            col_iva_v_name = col_iva_v[0] if col_iva_v else 'IVA'
+            col_cbte_v_name = col_cbte_v[0] if col_cbte_v else df_v.columns[0]
 
-            for c in ['Neto Gravado', 'Exento', 'No Gravado', 'IVA', 'Total del Comprobante', 'Total del concepto']:
-                if c in df_v.columns:
-                    df_v[c] = df_v[c].apply(clean_num)
+            # Convertir columna IVA a numérico
+            if col_iva_v_name in df_v.columns:
+                df_v[col_iva_v_name] = df_v[col_iva_v_name].apply(clean_num)
+            else:
+                df_v[col_iva_v_name] = 0.0
+
+            # Filtrar filas de totales o encabezados vacíos (donde IVA == 0 y cbte no es válido)
+            df_v_valid = df_v[df_v[col_iva_v_name] != 0.0].copy()
+
+            # Separar Facturas y Notas de Crédito
+            v_nc = df_v_valid[df_v_valid[col_cbte_v_name].astype(str).str.contains('Nota de Crédito|NC', case=False, na=False)]
+            v_facturas = df_v_valid[~df_v_valid[col_cbte_v_name].astype(str).str.contains('Nota de Crédito|NC', case=False, na=False)]
 
             # 2. COMPRAS
-            df_c_raw = cargar_excel_seguro(file_compras, header=1)
-            df_c_raw.columns = [str(c).strip() for c in df_c_raw.columns]
+            df_c = cargar_excel_seguro(file_compras)
 
-            col_cbte_c = [c for c in df_c_raw.columns if 'comprobante' in c.lower()]
-            col_fecha_c = [c for c in df_c_raw.columns if 'fecha' in c.lower()]
+            col_iva_c = [c for c in df_c.columns if c.lower() == 'iva']
+            col_cbte_c = [c for c in df_c.columns if 'comprobante' in c.lower()]
 
-            if col_cbte_c and col_fecha_c:
-                df_c = df_c_raw[df_c_raw[col_fecha_c[0]].notnull() & df_c_raw[col_cbte_c[0]].astype(str).str.contains('Factura|Nota de Crédito|Liq Compra Directa', case=False, na=False)].copy()
+            col_iva_c_name = col_iva_c[0] if col_iva_c else 'IVA'
+            col_cbte_c_name = col_cbte_c[0] if col_cbte_c else df_c.columns[0]
+
+            if col_iva_c_name in df_c.columns:
+                df_c[col_iva_c_name] = df_c[col_iva_c_name].apply(clean_num)
             else:
-                df_c = df_c_raw.copy()
+                df_c[col_iva_c_name] = 0.0
 
-            for c in ['Neto Gravado', 'Subtotal Exento', 'No Gravado', 'IVA', 'Subtotal de Percepciones', 'Total del Comprobante']:
-                if c in df_c.columns:
-                    df_c[c] = df_c[c].apply(clean_num)
+            df_c_valid = df_c[df_c[col_iva_c_name] != 0.0].copy()
+
+            c_nc = df_c_valid[df_c_valid[col_cbte_c_name].astype(str).str.contains('Nota de Crédito|NC', case=False, na=False)]
+            c_facturas = df_c_valid[~df_c_valid[col_cbte_c_name].astype(str).str.contains('Nota de Crédito|NC', case=False, na=False)]
 
             # 3. CÁLCULOS DDJJ F.2002
-            col_tipo_v = col_cbte_v[0] if col_cbte_v else 'Comprobante'
-            col_tipo_c = col_cbte_c[0] if col_cbte_c else 'Comprobante'
+            iva_v_facturas = float(v_facturas[col_iva_v_name].sum())
+            iva_v_nc = float(v_nc[col_iva_v_name].sum())
 
-            v_facturas = df_v[~df_v[col_tipo_v].astype(str).str.contains('Nota de Crédito', case=False)]
-            v_nc = df_v[df_v[col_tipo_v].astype(str).str.contains('Nota de Crédito', case=False)]
-
-            c_facturas = df_c[~df_c[col_tipo_c].astype(str).str.contains('Nota de Crédito', case=False)]
-            c_nc = df_c[df_c[col_tipo_c].astype(str).str.contains('Nota de Crédito', case=False)]
-
-            # Asegurar conversión a float explícita para evitar tipos 'str' en sum()
-            iva_v_facturas = float(pd.to_numeric(v_facturas['IVA'], errors='coerce').sum()) if 'IVA' in v_facturas.columns else 0.0
-            iva_v_nc = float(pd.to_numeric(v_nc['IVA'], errors='coerce').sum()) if 'IVA' in v_nc.columns else 0.0
-
-            iva_c_facturas = float(pd.to_numeric(c_facturas['IVA'], errors='coerce').sum()) if 'IVA' in c_facturas.columns else 0.0
-            iva_c_nc = float(pd.to_numeric(c_nc['IVA'], errors='coerce').sum()) if 'IVA' in c_nc.columns else 0.0
+            iva_c_facturas = float(c_facturas[col_iva_c_name].sum())
+            iva_c_nc = float(c_nc[col_iva_c_name].sum())
 
             # Débito = IVA Ventas Facturas - IVA NC Compras
             debito_fiscal = iva_v_facturas - abs(iva_c_nc)
